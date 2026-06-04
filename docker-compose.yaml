@@ -1,0 +1,8 @@
+services:
+  glitchtip-telegram:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.yaml:/config.yaml:ro

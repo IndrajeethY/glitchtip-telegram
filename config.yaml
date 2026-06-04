@@ -1,0 +1,10 @@
+bot_token: "YOUR_BOT_TOKEN"
+listen: ":8080"
+
+routes:
+  - key: "frontend-app"
+    chat_id: -100123456789
+    # topic_id: 42    # optional — send to a specific forum/supergroup topic
+
+  - key: "backend-api"
+    chat_id: -100987654321
