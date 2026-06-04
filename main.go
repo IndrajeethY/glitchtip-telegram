@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -8,21 +9,16 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
-	BotToken string  `yaml:"bot_token"`
-	Listen   string  `yaml:"listen"`
-	Routes   []Route `yaml:"routes"`
-}
-
-type Route struct {
-	Key     string `yaml:"key"`
-	ChatID  int64  `yaml:"chat_id"`
-	TopicID *int   `yaml:"topic_id,omitempty"`
+	BotToken string `yaml:"bot_token"`
+	APIKey   string `yaml:"api_key"`
+	Listen   string `yaml:"listen"`
 }
 
 type GlitchTipAlert struct {
@@ -50,7 +46,6 @@ type GlitchTipAlert struct {
 }
 
 var config Config
-var routeMap map[string]Route
 
 func main() {
 	cfgPath := "config.yaml"
@@ -68,22 +63,20 @@ func main() {
 	if config.BotToken == "" {
 		log.Fatal("bot_token is required")
 	}
+	if config.APIKey == "" {
+		log.Fatal("api_key is required")
+	}
 	if config.Listen == "" {
 		config.Listen = ":8080"
 	}
 
-	routeMap = make(map[string]Route)
-	for _, r := range config.Routes {
-		routeMap[r.Key] = r
-	}
-
-	http.HandleFunc("/webhook/", handleWebhook)
+	http.HandleFunc("/webhook", handleWebhook)
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, "ok")
 	})
 
-	log.Printf("listening on %s with %d route(s)", config.Listen, len(config.Routes))
+	log.Printf("listening on %s", config.Listen)
 	log.Fatal(http.ListenAndServe(config.Listen, nil))
 }
 
@@ -93,12 +86,33 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	key := strings.TrimPrefix(r.URL.Path, "/webhook/")
-	route, ok := routeMap[key]
-	if !ok {
-		log.Printf("unknown route key: %s", key)
-		http.Error(w, "unknown route", http.StatusNotFound)
+	q := r.URL.Query()
+
+	key := q.Get("key")
+	if subtle.ConstantTimeCompare([]byte(key), []byte(config.APIKey)) != 1 {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
+	}
+
+	chatIDStr := q.Get("chat_id")
+	if chatIDStr == "" {
+		http.Error(w, "chat_id is required", http.StatusBadRequest)
+		return
+	}
+	chatID, err := strconv.ParseInt(chatIDStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid chat_id", http.StatusBadRequest)
+		return
+	}
+
+	var topicID *int
+	if t := q.Get("topic_id"); t != "" {
+		v, err := strconv.Atoi(t)
+		if err != nil {
+			http.Error(w, "invalid topic_id", http.StatusBadRequest)
+			return
+		}
+		topicID = &v
 	}
 
 	body, err := io.ReadAll(r.Body)
@@ -117,13 +131,13 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	msg := formatMessage(alert)
-	if err := sendTelegram(route, msg); err != nil {
+	if err := sendTelegram(chatID, topicID, msg); err != nil {
 		log.Printf("failed to send to telegram: %v", err)
 		http.Error(w, "telegram error", http.StatusBadGateway)
 		return
 	}
 
-	log.Printf("sent alert to chat %d (route: %s): %s", route.ChatID, key, alert.Issue.Title)
+	log.Printf("sent alert to chat %d: %s", chatID, alert.Issue.Title)
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprint(w, "ok")
 }
@@ -148,15 +162,21 @@ func formatMessage(a GlitchTipAlert) string {
 	fmt.Fprintf(&b, "%s <b>[%s] %s</b>\n", emoji, level, escapeHTML(a.Project.Name))
 	fmt.Fprintf(&b, "\n<b>%s</b>", escapeHTML(a.Issue.Title))
 
-	if a.Issue.Metadata.Value != "" {
-		fmt.Fprintf(&b, "\n<code>%s</code>", escapeHTML(a.Issue.Metadata.Value))
+	hasDetails := a.Issue.Metadata.Value != "" || a.Issue.Culprit != "" || a.Issue.Count > 0
+	if hasDetails {
+		b.WriteString("\n\n<blockquote expandable>")
+		if a.Issue.Metadata.Value != "" {
+			fmt.Fprintf(&b, "\n<code>%s</code>", escapeHTML(a.Issue.Metadata.Value))
+		}
+		if a.Issue.Culprit != "" {
+			fmt.Fprintf(&b, "\n📍 <code>%s</code>", escapeHTML(a.Issue.Culprit))
+		}
+		if a.Issue.Count > 0 {
+			fmt.Fprintf(&b, "\n🔢 Events: %d", a.Issue.Count)
+		}
+		b.WriteString("\n</blockquote>")
 	}
-	if a.Issue.Culprit != "" {
-		fmt.Fprintf(&b, "\n📍 <code>%s</code>", escapeHTML(a.Issue.Culprit))
-	}
-	if a.Issue.Count > 0 {
-		fmt.Fprintf(&b, "\n🔢 Events: %d", a.Issue.Count)
-	}
+
 	if a.Issue.URL != "" {
 		fmt.Fprintf(&b, "\n\n<a href=\"%s\">View in GlitchTip</a>", a.Issue.URL)
 	}
@@ -171,17 +191,17 @@ func escapeHTML(s string) string {
 	return s
 }
 
-func sendTelegram(route Route, text string) error {
+func sendTelegram(chatID int64, topicID *int, text string) error {
 	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", config.BotToken)
 
 	params := url.Values{}
-	params.Set("chat_id", fmt.Sprintf("%d", route.ChatID))
+	params.Set("chat_id", fmt.Sprintf("%d", chatID))
 	params.Set("text", text)
 	params.Set("parse_mode", "HTML")
 	params.Set("disable_web_page_preview", "true")
 
-	if route.TopicID != nil {
-		params.Set("message_thread_id", fmt.Sprintf("%d", *route.TopicID))
+	if topicID != nil {
+		params.Set("message_thread_id", fmt.Sprintf("%d", *topicID))
 	}
 
 	resp, err := http.PostForm(apiURL, params)
