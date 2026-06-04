@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
@@ -11,63 +12,48 @@ import (
 	"os"
 	"strconv"
 	"strings"
-
-	"gopkg.in/yaml.v3"
 )
 
-type Config struct {
-	BotToken string `yaml:"bot_token"`
-	APIKey   string `yaml:"api_key"`
-	Listen   string `yaml:"listen"`
+type AttachmentField struct {
+	Title string `json:"title"`
+	Value string `json:"value"`
+	Short bool   `json:"short"`
+}
+
+type Attachment struct {
+	Title     string            `json:"title"`
+	TitleLink string            `json:"title_link"`
+	Text      string            `json:"text"`
+	ImageURL  *string           `json:"image_url"`
+	Color     string            `json:"color"`
+	Fields    []AttachmentField `json:"fields"`
+	MrkdwnIn  []string          `json:"mrkdown_in"`
 }
 
 type GlitchTipAlert struct {
-	Alias     string `json:"alias"`
-	Text      string `json:"text"`
-	ProjectID int    `json:"project_id"`
-	Issue     struct {
-		ID       int    `json:"id"`
-		Title    string `json:"title"`
-		Culprit  string `json:"culprit"`
-		URL      string `json:"url"`
-		Count    int    `json:"count"`
-		Level    string `json:"level"`
-		Metadata struct {
-			Type     string `json:"type"`
-			Value    string `json:"value"`
-			Filename string `json:"filename"`
-		} `json:"metadata"`
-	} `json:"issue"`
-	Project struct {
-		Name string `json:"name"`
-		Slug string `json:"slug"`
-	} `json:"project"`
-	TriggerType string `json:"trigger_type"`
+	Alias       string       `json:"alias"`
+	Text        string       `json:"text"`
+	Attachments []Attachment `json:"attachments"`
 }
 
-var config Config
+var (
+	botToken string
+	apiKey   string
+	port     string
+)
 
 func main() {
-	cfgPath := "config.yaml"
-	if len(os.Args) > 1 {
-		cfgPath = os.Args[1]
-	}
+	loadEnv(".env")
 
-	data, err := os.ReadFile(cfgPath)
-	if err != nil {
-		log.Fatalf("failed to read config: %v", err)
+	botToken = getEnv("BOT_TOKEN", "")
+	apiKey = getEnv("API_KEY", "")
+	port = getEnv("PORT", "8080")
+
+	if botToken == "" {
+		log.Fatal("BOT_TOKEN is required")
 	}
-	if err := yaml.Unmarshal(data, &config); err != nil {
-		log.Fatalf("failed to parse config: %v", err)
-	}
-	if config.BotToken == "" {
-		log.Fatal("bot_token is required")
-	}
-	if config.APIKey == "" {
-		log.Fatal("api_key is required")
-	}
-	if config.Listen == "" {
-		config.Listen = ":8080"
+	if apiKey == "" {
+		log.Fatal("API_KEY is required")
 	}
 
 	http.HandleFunc("/webhook", handleWebhook)
@@ -76,8 +62,42 @@ func main() {
 		fmt.Fprint(w, "ok")
 	})
 
-	log.Printf("listening on %s", config.Listen)
-	log.Fatal(http.ListenAndServe(config.Listen, nil))
+	addr := ":" + port
+	log.Printf("listening on %s", addr)
+	log.Fatal(http.ListenAndServe(addr, nil))
+}
+
+func loadEnv(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+		v = strings.Trim(v, "\"'")
+		if os.Getenv(k) == "" {
+			os.Setenv(k, v)
+		}
+	}
+}
+
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
 
 func handleWebhook(w http.ResponseWriter, r *http.Request) {
@@ -89,7 +109,7 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 
 	key := q.Get("key")
-	if subtle.ConstantTimeCompare([]byte(key), []byte(config.APIKey)) != 1 {
+	if subtle.ConstantTimeCompare([]byte(key), []byte(apiKey)) != 1 {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -137,51 +157,85 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("sent alert to chat %d: %s", chatID, alert.Issue.Title)
+	title := alert.Text
+	if len(alert.Attachments) > 0 {
+		title = alert.Attachments[0].Title
+	}
+	log.Printf("sent alert to chat %d: %s", chatID, title)
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprint(w, "ok")
 }
 
 func formatMessage(a GlitchTipAlert) string {
-	level := strings.ToUpper(a.Issue.Level)
-	if level == "" {
-		level = "ERROR"
-	}
-
-	emoji := "🔴"
-	switch strings.ToLower(a.Issue.Level) {
-	case "warning":
-		emoji = "🟡"
-	case "info":
-		emoji = "🔵"
-	case "debug":
-		emoji = "⚪"
+	if len(a.Attachments) == 0 {
+		return escapeHTML(a.Text)
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s <b>[%s] %s</b>\n", emoji, level, escapeHTML(a.Project.Name))
-	fmt.Fprintf(&b, "\n<b>%s</b>", escapeHTML(a.Issue.Title))
 
-	hasDetails := a.Issue.Metadata.Value != "" || a.Issue.Culprit != "" || a.Issue.Count > 0
-	if hasDetails {
-		b.WriteString("\n\n<blockquote expandable>")
-		if a.Issue.Metadata.Value != "" {
-			fmt.Fprintf(&b, "\n<code>%s</code>", escapeHTML(a.Issue.Metadata.Value))
+	for i, att := range a.Attachments {
+		if i > 0 {
+			b.WriteString("\n\n───────────────\n\n")
 		}
-		if a.Issue.Culprit != "" {
-			fmt.Fprintf(&b, "\n📍 <code>%s</code>", escapeHTML(a.Issue.Culprit))
+
+		emoji := emojiForColor(att.Color)
+
+		project := fieldValue(att.Fields, "Project")
+		if project != "" {
+			fmt.Fprintf(&b, "%s <b>[%s]</b>\n", emoji, escapeHTML(project))
+		} else {
+			fmt.Fprintf(&b, "%s ", emoji)
 		}
-		if a.Issue.Count > 0 {
-			fmt.Fprintf(&b, "\n🔢 Events: %d", a.Issue.Count)
+
+		if att.TitleLink != "" {
+			fmt.Fprintf(&b, "\n<a href=\"%s\">%s</a>", att.TitleLink, escapeHTML(att.Title))
+		} else {
+			fmt.Fprintf(&b, "\n<b>%s</b>", escapeHTML(att.Title))
 		}
-		b.WriteString("\n</blockquote>")
+
+		hasDetails := att.Text != "" || len(att.Fields) > 0
+		if hasDetails {
+			b.WriteString("\n\n<blockquote expandable>")
+			if att.Text != "" {
+				fmt.Fprintf(&b, "\n📍 <code>%s</code>", escapeHTML(att.Text))
+			}
+			for _, f := range att.Fields {
+				if strings.EqualFold(f.Title, "Project") {
+					continue
+				}
+				fmt.Fprintf(&b, "\n%s: %s", escapeHTML(f.Title), escapeHTML(f.Value))
+			}
+			b.WriteString("\n</blockquote>")
+		}
 	}
 
-	if a.Issue.URL != "" {
-		fmt.Fprintf(&b, "\n\n<a href=\"%s\">View in GlitchTip</a>", a.Issue.URL)
+	if len(a.Attachments) > 1 {
+		fmt.Fprintf(&b, "\n\n📊 %d issues total", len(a.Attachments))
 	}
 
 	return b.String()
+}
+
+func emojiForColor(color string) string {
+	switch strings.ToLower(color) {
+	case "#e9b949":
+		return "🟡"
+	case "#4b60b4":
+		return "🔵"
+	case "#e52b50":
+		return "🔴"
+	default:
+		return "⚪"
+	}
+}
+
+func fieldValue(fields []AttachmentField, title string) string {
+	for _, f := range fields {
+		if strings.EqualFold(f.Title, title) {
+			return f.Value
+		}
+	}
+	return ""
 }
 
 func escapeHTML(s string) string {
@@ -192,7 +246,7 @@ func escapeHTML(s string) string {
 }
 
 func sendTelegram(chatID int64, topicID *int, text string) error {
-	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", config.BotToken)
+	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", botToken)
 
 	params := url.Values{}
 	params.Set("chat_id", fmt.Sprintf("%d", chatID))
